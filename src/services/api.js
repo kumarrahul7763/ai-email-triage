@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // Create axios instance with base URL
 const API = axios.create({
-  baseURL: 'http://localhost:5000/api',
+  baseURL: 'http://localhost:5001/api',
   timeout: 30000, // 30 second timeout
   headers: {
     'Content-Type': 'application/json',
@@ -39,7 +39,7 @@ API.interceptors.response.use(
  */
 export const checkHealth = async () => {
   try {
-    const response = await axios.get('http://localhost:5000/health', {
+    const response = await axios.get('http://localhost:5001/health', {
       timeout: 5000 // 5 second timeout for health check
     });
     return { 
@@ -87,7 +87,7 @@ export const analyzeEmail = async (emailText) => {
     if (error.code === 'ERR_NETWORK') {
       throw new Error(
         'Network error. Please check:\n' +
-        '1. Backend server is running (http://localhost:5000)\n' +
+        '1. Backend server is running (http://localhost:5001)\n' +
         '2. No firewall is blocking the connection\n' +
         '3. CORS is properly configured'
       );

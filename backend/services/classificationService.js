@@ -1,8 +1,7 @@
 import axios from 'axios';
 
-// Hugging Face API configuration
-const HF_API_URL = 'https://api-inference.huggingface.co/models/facebook/bart-large-mnli';
-const HF_API_KEY = process.env.HF_API_KEY || '';
+// Hugging Face API configuration (fallback)
+const HF_API_URL = 'https://api-inference.huggingface.co/models/MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli';
 
 // Category labels for classification
 const CATEGORIES = ['Finance', 'Technical', 'Spam', 'Support', 'Promotional / Marketing'];
@@ -33,22 +32,30 @@ const DEPARTMENT_MAP = {
 };
 
 /**
- * Classify a single email using Hugging Face API with fallback to rule-based logic
+ * Classify a single email using Gemini API with fallback to Hugging Face and rule-based logic
  * @param {string} emailText - The email text to classify
- * @returns {Object} Classification result with category, priority, department, explanation, and reply
+ * @returns {Object} Classification result with category, priority, department, explanation, reply, and model_used
  */
 export const classifyEmail = async (emailText) => {
   try {
-    // Try Hugging Face API first
-    const result = await classifyWithHuggingFace(emailText);
+    // Try Groq API first
+    const result = await classifyWithGroq(emailText);
     // Apply validation layer to force promotional classification if needed
     return validatePromotionalClassification(emailText, result);
-  } catch (error) {
-    console.warn('Hugging Face API failed, using fallback:', error.message);
-    // Fallback to rule-based classification
-    const result = classifyWithRules(emailText);
-    // Apply validation layer to force promotional classification if needed
-    return validatePromotionalClassification(emailText, result);
+  } catch (groqError) {
+    console.warn('Groq API failed, trying Hugging Face:', groqError.message);
+    try {
+      // Fallback to Hugging Face API
+      const result = await classifyWithHuggingFace(emailText);
+      // Apply validation layer to force promotional classification if needed
+      return validatePromotionalClassification(emailText, result);
+    } catch (hfError) {
+      console.warn('Hugging Face API failed, using rule-based fallback:', hfError.message);
+      // Fallback to rule-based classification
+      const result = classifyWithRules(emailText);
+      // Apply validation layer to force promotional classification if needed
+      return validatePromotionalClassification(emailText, result);
+    }
   }
 };
 
@@ -77,6 +84,7 @@ export const classifyEmailsBulk = async (emails) => {
         reply: 'Unable to classify',
         originalEmail: email.text || email.content || email.body || '',
         id: email.id || results.length + 1,
+        model_used: 'Error',
         error: error.message
       });
     }
@@ -86,11 +94,149 @@ export const classifyEmailsBulk = async (emails) => {
 };
 
 /**
+ * Classify email using Groq API
+ * @param {string} text - Email text
+ * @returns {Object} Classification result
+ */
+const classifyWithGroq = async (text) => {
+  const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+  
+  if (!GROQ_API_KEY) {
+    throw new Error('Groq API key not configured');
+  }
+  
+  // Validate API key format (Groq keys start with 'gsk_')
+  if (!GROQ_API_KEY.startsWith('gsk_')) {
+    console.warn('Warning: Groq API key may be invalid. Expected format: gsk_...');
+  }
+  
+  // Log API key status (first 10 chars only for security)
+  console.log(`Using Groq API key: ${GROQ_API_KEY.substring(0, 10)}...`);
+
+  const prompt = `You are a highly accurate enterprise AI email classification system.
+
+Classify emails based on intent and context.
+
+Categories:
+- Technical Support
+- Finance
+- HR
+- Spam
+- Promotional / Marketing
+- General
+
+Rules:
+- If email promotes a service, course, event, or offer → Promotional / Marketing
+- If login/bug issues → Technical Support
+- If money/invoice → Finance
+- If job/hiring → HR
+- If fraud/suspicious → Spam
+- Else → General
+
+Return ONLY JSON:
+
+{
+  "category": "",
+  "priority": "",
+  "confidence": "",
+  "department": "",
+  "explanation": ""
+}
+
+Email: ${text}`;
+
+  try {
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'llama3-8b-8192',
+        messages: [
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.1,
+        max_tokens: 1024
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 30000
+      }
+    );
+
+    const responseText = response.data.choices[0].message.content;
+
+    // Extract JSON from response
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('Invalid JSON response from Groq');
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    // Validate required fields
+    if (!parsed.category || !parsed.priority || !parsed.confidence || !parsed.department || !parsed.explanation) {
+      throw new Error('Missing required fields in Groq response');
+    }
+
+    // Generate reply based on category and priority
+    const reply = generateReply(parsed.category, parsed.priority);
+
+    return {
+      category: parsed.category,
+      priority: parsed.priority,
+      department: parsed.department,
+      confidence: parseInt(parsed.confidence, 10) || 85,
+      explanation: parsed.explanation,
+      reply,
+      model_used: 'Groq (llama3-8b-8192)'
+    };
+  } catch (error) {
+    // Log detailed error information for debugging
+    if (error.response) {
+      console.error('Groq API Error Response:', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data
+      });
+      
+      // Provide specific guidance for 400 errors
+      if (error.response.status === 400) {
+        console.error('');
+        console.error('=== GROQ API 400 ERROR - TROUBLESHOOTING ===');
+        console.error('This error usually means your API key is invalid or expired.');
+        console.error('');
+        console.error('To fix this:');
+        console.error('1. Go to https://console.groq.com/keys');
+        console.error('2. Generate a new API key');
+        console.error('3. Update the GROQ_API_KEY in ai-email-triage/backend/.env');
+        console.error('4. Restart your backend server');
+        console.error('');
+        console.error('Current API key starts with:', GROQ_API_KEY.substring(0, 10) + '...');
+        console.error('==========================================');
+        console.error('');
+      }
+    } else if (error.request) {
+      console.error('Groq API No Response:', error.message);
+    } else {
+      console.error('Groq API Error:', error.message);
+    }
+    throw error;
+  }
+};
+
+/**
  * Classify email using Hugging Face API
  * @param {string} text - Email text
  * @returns {Object} Classification result
  */
 const classifyWithHuggingFace = async (text) => {
+  const HF_API_KEY = process.env.HF_API_KEY || '';
+  
   const headers = {
     'Content-Type': 'application/json'
   };
@@ -131,7 +277,8 @@ const classifyWithHuggingFace = async (text) => {
     department: DEPARTMENT_MAP[category] || 'General',
     confidence: Math.round(confidence * 100),
     explanation,
-    reply
+    reply,
+    model_used: 'Hugging Face'
   };
 };
 
@@ -196,7 +343,8 @@ const classifyWithRules = (text) => {
     department: DEPARTMENT_MAP[category] || 'General',
     confidence: 85, // Default confidence for rule-based
     explanation,
-    reply
+    reply,
+    model_used: 'Rule-based'
   };
 };
 
